@@ -45,8 +45,15 @@ Follow these phases in order when creating a new test application.
    ├── simulator.py           # (Optional) simulated measurements for dev/test
    ├── main.py                # CLI entry point
    ├── requirements.txt       # nisystemlink-clients + hardware drivers
+   ├── build_nipkg.bat        # Windows nipkg build script
+   ├── package/
+   │   ├── control            # nipkg metadata (name, version, deps)
+   │   ├── instructions        # maps install/uninstall scripts
+   │   ├── postinstall.bat    # creates venv + pip installs
+   │   └── preuninstall.bat   # removes venv on uninstall
    └── deploy/
-       └── work-item-template.json
+       ├── work-item-template.json
+       └── workflow.json
    ```
 2. Create `requirements.txt` with `nisystemlink-clients` and any hardware driver packages
 3. Create a configuration module (see Phase 1a below)
@@ -318,37 +325,139 @@ from nisystemlink.clients.file import FileClient
 
 ### Phase 6: Packaging and Deployment
 
-1. **Package as `.nipkg`** — include Python source, dependency manifest, config files, install/uninstall scripts
-2. **Version** with semantic versioning in package metadata
-3. **Upload** to a SystemLink feed via `slcli feed package upload`
-4. **Deploy** to test systems via SystemLink software deployment / NI Package Manager
+Package as a `.nipkg` for distribution through SystemLink feeds.
 
-### Phase 7: Work Item Template
+#### 6a: Package directory structure
 
-Create and publish a work item template for this test.
+```
+tests/<PART_NUMBER>/
+├── package/
+│   ├── control          # nipkg metadata
+│   ├── instructions     # maps install/uninstall scripts
+│   ├── postinstall.bat  # creates venv + pip installs
+│   └── preuninstall.bat # removes venv on uninstall
+├── build_nipkg.bat      # build script (run on Windows)
+└── ...source files...
+```
 
-1. Create `deploy/work-item-template.json` in the repo
-2. **IMPORTANT**: Use `partNumbers` (array of strings), NOT `partNumberFilter`:
-   ```json
-   {
-     "name": "MyTestProgram",
-     "type": "testplan",
-     "templateGroup": "My Test Group",
-     "partNumbers": ["PART-NUMBER-HERE"],
-     "description": "...",
-     "summary": "...",
-     "resources": {
-       "systems": { "count": 1, "filter": "" },
-       "duts": { "count": 1, "filter": "AssetType == \"DEVICE_UNDER_TEST\"" },
-       "fixtures": { "count": 0, "filter": "" }
-     },
-     "properties": {
-       "param_key": "default_value"
-     }
-   }
-   ```
-3. Publish via: `slcli workitem template create --file deploy/work-item-template.json -w <WORKSPACE>`
-4. Update via: `slcli workitem template update <TEMPLATE_ID> --file deploy/work-item-template.json`
+#### 6b: Control file (`package/control`)
+
+```
+Package: <package-name>
+Version: 1.0.0
+Section: test-applications
+Architecture: windows_all
+Depends: ni-python (>= 3.10)
+Maintainer: Team Name <email>
+XB-Plugin: file
+XB-UserVisible: yes
+Description: Short description
+ Extended description (indented with one space).
+```
+
+#### 6c: Instructions file (`package/instructions`)
+
+```ini
+[Instructions]
+postinstall=postinstall.bat
+preuninstall=preuninstall.bat
+```
+
+#### 6d: Post-install script (`package/postinstall.bat`)
+
+Creates a Python venv at the install location and installs dependencies:
+
+```bat
+@echo off
+set INSTALL_DIR=C:\Program Files\NI\<package-name>
+set VENV_DIR=%INSTALL_DIR%\venv
+python -m venv "%VENV_DIR%"
+"%VENV_DIR%\Scripts\pip.exe" install --no-cache-dir -r "%INSTALL_DIR%\requirements.txt"
+```
+
+#### 6e: Pre-uninstall script (`package/preuninstall.bat`)
+
+```bat
+@echo off
+set INSTALL_DIR=C:\Program Files\NI\<package-name>
+if exist "%INSTALL_DIR%\venv" rmdir /s /q "%INSTALL_DIR%\venv"
+```
+
+#### 6f: Build script (`build_nipkg.bat`)
+
+The build script:
+1. Creates `build/nipkg/data/Program Files/NI/<package-name>/` with app source files
+2. Creates `build/nipkg/control/` with control, instructions, and install scripts
+3. Runs `nipkg pack build/nipkg dist/<package-name>_<version>_windows_all.nipkg`
+
+**Requires**: NI Package Manager CLI (`nipkg`) on the build machine (Windows).
+
+#### 6g: Upload and deploy
+
+```bash
+# Upload to a SystemLink feed
+slcli feed package upload --feed "<feed-name>" --file dist/<package>.nipkg
+
+# On the target system, the package installs to:
+# C:\Program Files\NI\<package-name>\
+# Run via:
+"C:\Program Files\NI\<package-name>\venv\Scripts\python.exe" ^
+  "C:\Program Files\NI\<package-name>\main.py" --work-item-id <ID>
+```
+
+### Phase 7: Work Item Template and Workflow
+
+Create and publish a work item template with an associated workflow.
+
+#### 7a: Workflow (`deploy/workflow.json`)
+
+Define the state machine for work item lifecycle. Standard states:
+
+```
+NEW → DEFINED → REVIEWED → SCHEDULED → IN_PROGRESS → PENDING_APPROVAL → CLOSED
+                                         ↕ PAUSED                        CANCELED
+```
+
+The workflow JSON contains:
+- **`actions`**: Named actions with `executionAction` (ABORT, APPROVE, CANCEL, END, PAUSE, REJECT, RESUME, SCHEDULE, START, SUBMIT, UNSCHEDULE)
+- **`states`**: Each with `substates` and `availableActions` that define valid transitions
+
+Import with: `slcli workitem workflow import --file deploy/workflow.json -w <WORKSPACE>`
+Update with: `slcli workitem workflow update --id <WORKFLOW_ID> --file deploy/workflow.json`
+
+#### 7b: Template (`deploy/work-item-template.json`)
+
+**IMPORTANT**: Use `partNumbers` (array of strings), NOT `partNumberFilter`.
+Include `workflowId` to associate the workflow.
+
+```json
+{
+  "name": "My Test Name",
+  "type": "testplan",
+  "templateGroup": "My Test Group",
+  "partNumbers": ["PART-NUMBER-HERE"],
+  "workflowId": "<WORKFLOW_ID>",
+  "description": "...",
+  "summary": "...",
+  "resources": {
+    "systems": { "count": 1, "filter": "" },
+    "duts": { "count": 1, "filter": "AssetType == \"DEVICE_UNDER_TEST\"" },
+    "fixtures": { "count": 0, "filter": "" }
+  },
+  "properties": {
+    "param_key": "default_value"
+  }
+}
+```
+
+Publish: `slcli workitem template create --file deploy/work-item-template.json -w <WORKSPACE>`
+Update: `slcli workitem template update <TEMPLATE_ID> --file deploy/work-item-template.json`
+
+#### 7c: Deployment order
+
+1. Import workflow first → get `<WORKFLOW_ID>`
+2. Add `workflowId` to template JSON
+3. Create/update template
 
 ### Phase 8: Error Handling
 

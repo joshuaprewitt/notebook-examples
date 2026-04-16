@@ -8,7 +8,7 @@ from nisystemlink.clients.core import HttpConfiguration
 
 logger = logging.getLogger(__name__)
 
-PROGRAM_NAME = "Battery18650Test"
+PROGRAM_NAME = "18650 Battery Test"
 PART_NUMBER = "B0CG1KL3RC"
 
 # 18650 battery product specifications — used as defaults when creating the product.
