@@ -36,88 +36,285 @@ Follow these phases in order when creating a new test application.
 
 ### Phase 1: Project Setup
 
-1. Create the project directory structure (see [project structure](./references/project-structure.md))
+1. Create the project directory structure:
+   ```
+   tests/<PART_NUMBER>/
+   ├── config.py              # Configuration, credentials, product specs
+   ├── initialization.py      # Work item → product/DUT/system resolution
+   ├── execution.py           # Result creation, step execution, file upload
+   ├── simulator.py           # (Optional) simulated measurements for dev/test
+   ├── main.py                # CLI entry point
+   ├── requirements.txt       # nisystemlink-clients + hardware drivers
+   └── deploy/
+       └── work-item-template.json
+   ```
 2. Create `requirements.txt` with `nisystemlink-clients` and any hardware driver packages
-3. Create a configuration module that reads `HttpConfiguration` from environment variables or config file
-4. **Never hard-code API keys** — use environment variables or SystemLink system credentials
+3. Create a configuration module (see Phase 1a below)
+4. **Never hard-code API keys** — use CLI args, environment variables, or system credentials
 
-### Phase 2: Initialization Module
+### Phase 1a: Configuration Module (`config.py`)
+
+The configuration module handles three credential modes:
+
+```python
+from nisystemlink.clients.core import HttpConfiguration
+
+def get_configuration(
+    server: str | None = None,
+    api_key: str | None = None,
+) -> HttpConfiguration | None:
+    """Build HttpConfiguration.
+
+    Priority:
+      1. Explicit server/api_key args (CLI flags for dev use).
+      2. SYSTEMLINK_SERVER_URI / SYSTEMLINK_API_KEY env vars.
+      3. None — SDK auto-discovers credentials on a managed system.
+    """
+    server = server or os.environ.get("SYSTEMLINK_SERVER_URI")
+    api_key = api_key or os.environ.get("SYSTEMLINK_API_KEY")
+
+    if server and api_key:
+        return HttpConfiguration(server_uri=server, api_key=api_key)
+    return None
+```
+
+**IMPORTANT**: When `get_configuration()` returns `None`, the SDK's `HttpConfigurationManager`
+auto-discovers credentials on a managed system. This is the production path. The explicit
+server/api_key path is for **developer machines** that are not SystemLink-managed.
+
+Also define `PRODUCT_SPECS` as a dict of default spec properties. These serve as fallbacks
+when the product on the server doesn't have all `spec.*` properties populated:
+
+```python
+PRODUCT_SPECS = {
+    "spec.voltage_low_limit": "2.5",
+    "spec.voltage_high_limit": "4.2",
+    # ... all spec properties with string values
+}
+```
+
+### Phase 1b: CLI Entry Point (`main.py`)
+
+The main module MUST support three execution modes via argparse:
+
+```python
+parser.add_argument("--work-item-id", help="Work item ID. Omit for interactive.")
+parser.add_argument("--server", help="SystemLink server URI. For dev use.")
+parser.add_argument("--api-key", help="SystemLink API key. For dev use.")
+```
+
+- **Interactive mode**: no `--work-item-id` → prompts operator
+- **Automated mode**: `--work-item-id` passed → no prompts, headless
+- **Developer mode**: `--server` + `--api-key` → uses explicit credentials on non-managed machine
+
+### Phase 2: Initialization Module (`initialization.py`)
 
 Build the initialization logic that runs before any test steps execute.
 
-1. **Prompt for work item ID** — accept via CLI argument, input prompt, or barcode scan
-2. **Query the work item** — use the work item client to fetch the full record
-3. **Resolve the product** — query Test Monitor Product API by part number from the work item:
-   - If product exists: read product `properties` as test specs (limits, conditions)
-   - If product does not exist: prompt operator for data sheet or manual spec entry, then create the product with specs stored as properties
-4. **Resolve the DUT** — query the Asset API using the work item's DUT resource assignment; extract serial number, model, and asset properties
-5. **Resolve the system** — confirm the assigned system matches the local host
-6. **Read work item properties** — make them available as test parameters (profile, overrides)
-7. **Validate** — abort with clear error if any required parameter is missing
-8. **Display summary** — show resolved parameters for operator confirmation
+1. **Accept work item ID** — via CLI argument or interactive prompt
+2. **Query the work item** — `WorkItemClient(configuration).get_work_item(work_item_id)`
+3. **Resolve the product** — query by part number; if missing, create with `PRODUCT_SPECS` defaults (interactive only)
+4. **Resolve spec properties** — read product `properties` for limits. Fall back to `PRODUCT_SPECS` for any missing `spec.*` key
+5. **Resolve the DUT** — query Asset API using `work_item.resources.duts.selections[0].id`
+6. **Resolve the system/minionId** — see Phase 2a
+7. **Check fixture calibration** — warn if `PAST_RECOMMENDED_DUE_DATE`
+8. **Read work item properties** — available as test parameters
+9. **Validate** — abort if required parameters missing
+10. **Display summary** — in interactive mode, show parameters for operator confirmation
 
-### Phase 3: Test Execution
+### Phase 2a: System ID / MinionId Resolution
+
+The `system_id` is critical — it links results and files to the correct test system.
+
+**Two modes:**
+
+- **Managed system** (production, `configuration is None`): Read the local minionId from disk:
+  - Windows: `C:\ProgramData\National Instruments\salt\conf\minion_id`
+  - Linux: `/etc/salt/minion_id`
+  - The file contains a plain-text minion ID string
+
+- **Developer system** (`configuration is not None`): Use the system resource assigned to the
+  work item: `work_item.resources.systems.selections[0].id`
+
+```python
+def _resolve_system_id(work_item: WorkItem, is_dev_mode: bool) -> str | None:
+    if not is_dev_mode:
+        minion_id = _read_local_minion_id()
+        if minion_id:
+            return minion_id
+    # Dev mode or local read failed: use work item system resource
+    if work_item.resources and work_item.resources.systems:
+        selections = work_item.resources.systems.selections or []
+        if selections and selections[0].id:
+            return selections[0].id
+    return None
+```
+
+### Phase 3: Test Execution (`execution.py`)
 
 Build the test runner that creates results and steps.
 
 1. **Create a test result** with status `RUNNING` before any steps execute. Include:
-   - `programName`, `serialNumber`, `partNumber`, `operator`, `hostName`, `startedAt`
+   - `program_name`, `serial_number`, `part_number`, `operator`, `host_name`, `started_at`
+   - `system_id` (the resolved minionId)
    - Property `workItemId` set to the originating work item ID
-2. **Transition work item** to "In Progress"
-3. **Execute steps sequentially**. For each step:
-   - Log **inputs** as step properties with `input.` prefix (stimulus/config applied to DUT)
-   - Log **outputs** as step properties with `output.` prefix (raw DUT response)
-   - Record the **measurement** (primary value under evaluation)
-   - Record **limits** from product specs: `lowLimit`, `highLimit`, `units`, `comparisonType`
-   - Determine step **status** by comparing measurement against limits
-   - Record `step.startedAt`, `step.duration`, `step.limitSource`
-   - Continue after failures unless safety-critical
-4. **Update the result** — set final status (`PASSED`/`FAILED`/`ERRORED`), `totalTimeInSeconds`
-5. **Upload files** — all generated files (logs, waveforms, data) to File Service with metadata:
-   - `resultId`, `workItemId`, `minionId`, workspace, file type, timestamp
-   - Store file IDs in result property `fileIds`
-6. **Transition work item** to "Completed" or "Failed"
+   - `workspace` from the work item
+2. **Transition work item** to `IN_PROGRESS`
+3. **Execute steps sequentially** — see Phase 3a
+4. **Upload files** — see Phase 3b
+5. **Update the result** — set final status, `total_time_in_seconds`, `file_ids`
+6. **Transition work item** to `CLOSED`
+
+### Phase 3a: Step Creation
+
+**CRITICAL SDK requirements for `CreateStepRequest`:**
+
+- `step_id` is **required** — generate with `str(uuid.uuid4())`
+- `result_id` is **required**
+- `name` is **required**
+- Use `NamedValue` objects for `inputs` and `outputs` lists
+- Use `StepData` with `Measurement` objects for parametric data
+- Use `Status(status_type=StatusType.PASSED)` for status
+
+```python
+import uuid
+
+def _build_step(result_id, name, step_type, measurement_value, low_limit, high_limit, units, ...):
+    status_type = _compare(measurement_value, low_limit, high_limit)
+    return CreateStepRequest(
+        step_id=str(uuid.uuid4()),   # REQUIRED — must be unique
+        result_id=result_id,          # REQUIRED
+        name=name,                    # REQUIRED
+        step_type=step_type,
+        status=Status(status_type=status_type),
+        inputs=[NamedValue(name="input.load_current", value="2.5 A")],
+        outputs=[NamedValue(name="output.voltage", value=str(value))],
+        data=StepData(
+            text=name,
+            parameters=[
+                Measurement(
+                    name=name,
+                    status=status_type.value,
+                    measurement=str(measurement_value),
+                    lowLimit=str(low_limit),
+                    highLimit=str(high_limit),
+                    units=units,
+                    comparisonType="GELE",
+                )
+            ],
+        ),
+        properties={
+            "step.startedAt": started_at.isoformat(),
+            "step.duration": str(round(duration, 3)),
+            "step.limitSource": f"product:{part_number}",
+        },
+    )
+```
+
+**Spec lookup with fallback:**
+
+```python
+def _get_spec(product_props: dict, key: str) -> float:
+    value = product_props.get(key) or PRODUCT_SPECS.get(key)
+    if value is None:
+        raise RuntimeError(f"Missing product spec: {key}")
+    return float(value)
+```
+
+### Phase 3b: File Upload
+
+**CRITICAL SDK requirements for `FileClient.upload_file()`:**
+
+- The `file` parameter takes a **`BinaryIO`** object (not a file path)
+- Returns a **`str`** (the file ID), not an object with `.id`
+- The `metadata` parameter is a `dict[str, str]` — the SDK calls `json.dumps()` internally
+
+```python
+with open(log_path, "rb") as fp:
+    file_id = file_client.upload_file(
+        file=fp,
+        metadata={
+            "resultId": result_id,
+            "workItemId": ctx.work_item_id,
+            "minionId": ctx.system_id or "",
+            "fileType": "test-log",
+        },
+        workspace=ctx.work_item.workspace,
+    )
+```
 
 ### Phase 4: Result and Step Schema
 
-Every test result MUST conform to the schema defined in the
-[requirements reference](./references/requirements.md) Section 6.
+**Required result fields (CreateResultRequest):**
 
-**Required result properties:**
+| Field | Required | Notes |
+|---|---|---|
+| `status` | Yes | `Status(status_type=StatusType.RUNNING)` |
+| `program_name` | Yes | String |
+| `started_at` | No | `datetime` with UTC timezone |
+| `system_id` | No | MinionId string |
+| `host_name` | No | `socket.gethostname()` |
+| `part_number` | No | From work item |
+| `serial_number` | No | From DUT asset |
+| `operator` | No | From work item `assigned_to` |
+| `properties` | No | Dict — include `workItemId` |
+| `keywords` | No | List of strings |
+| `workspace` | No | From work item |
 
-| Key | Value |
-|---|---|
-| `workItemId` | The SystemLink work item ID |
-| `fileIds` | Comma-separated file IDs of uploaded artifacts |
+**Required step fields (CreateStepRequest):**
 
-**Required step properties:**
+| Field | Required | Notes |
+|---|---|---|
+| `step_id` | **Yes** | `str(uuid.uuid4())` — MUST be provided |
+| `result_id` | **Yes** | From created result |
+| `name` | **Yes** | Step display name |
+| `status` | No | `Status(status_type=...)` |
+| `step_type` | No | `NumericLimit`, `StringValue`, `PassFail` |
+| `inputs` | No | `List[NamedValue]` |
+| `outputs` | No | `List[NamedValue]` |
+| `data` | No | `StepData` with `Measurement` list |
+| `properties` | No | Dict for `step.*` and `input.*`/`output.*` |
 
-| Key Pattern | Description |
-|---|---|
-| `input.<name>` | Stimulus or configuration applied to the DUT |
-| `output.<name>` | Raw response or reading from the DUT |
-| `step.startedAt` | Step start timestamp (ISO 8601) |
-| `step.duration` | Step execution time in seconds |
-| `step.limitSource` | Origin of limits (e.g., `"product:P-BAT-001"`) |
-
-**Step types:** `NumericLimit`, `StringValue`, `PassFail`
-
-**Comparison types:** `GELE` (≥ low, ≤ high), `EQ`, `GT`, `LT`
+**UpdateResultRequest** — only `id` is required. Set `status`, `total_time_in_seconds`, `file_ids`, `properties`.
 
 ### Phase 5: SDK Client Usage
 
 All SystemLink communication MUST use `nisystemlink-clients`. No direct HTTP.
 
-| Operation | Client Class |
-|---|---|
-| Test results, steps, products | `TestMonitorClient` |
-| Work items | Work item / work order client |
-| DUT and fixture assets | `AssetManagementClient` |
-| Real-time tags | `TagClient` |
-| File upload | `FileClient` |
+**Verified import paths:**
 
-Configure `HttpConfiguration` once at startup and pass to all clients.
-Use the SDK's model classes (`TestResult`, `TestStep`, `Product`) — do not construct raw JSON.
+```python
+from nisystemlink.clients.core import HttpConfiguration
+from nisystemlink.clients.testmonitor import TestMonitorClient
+from nisystemlink.clients.testmonitor.models import (
+    CreateResultRequest, CreateStepRequest, UpdateResultRequest,
+    Measurement, NamedValue, Status, StatusType, StepData,
+)
+from nisystemlink.clients.product import ProductClient
+from nisystemlink.clients.product.models import CreateProductRequest, QueryProductsRequest
+from nisystemlink.clients.work_item import WorkItemClient
+from nisystemlink.clients.work_item.models import (
+    WorkItem, UpdateWorkItemRequest, UpdateWorkItemsRequest,
+)
+from nisystemlink.clients.assetmanagement import AssetManagementClient
+from nisystemlink.clients.assetmanagement.models import (
+    Asset, AssetType, CalibrationStatus, QueryAssetsRequest,
+)
+from nisystemlink.clients.file import FileClient
+```
+
+**SDK gotchas:**
+
+| Pitfall | Correct Usage |
+|---|---|
+| `CreateStepRequest` missing `step_id` | Always set `step_id=str(uuid.uuid4())` |
+| `FileClient.upload_file(file=path)` | Pass `BinaryIO`, not `Path`: `open(path, "rb")` |
+| `upload_file()` returns object with `.id` | Returns `str` directly |
+| `get_configuration()` returns `None` on managed system | SDK auto-discovers — do not raise error |
+| `StatusType` enum values | Use `StatusType.PASSED`, not string `"PASSED"` |
+| `Measurement` fields are strings | `measurement=str(value)`, `lowLimit=str(limit)` |
+| Product properties may be incomplete | Fall back to `PRODUCT_SPECS` defaults |
+| Work item state transitions | Use string values: `"IN_PROGRESS"`, `"CLOSED"` |
 
 ### Phase 6: Packaging and Deployment
 
@@ -128,18 +325,30 @@ Use the SDK's model classes (`TestResult`, `TestStep`, `Product`) — do not con
 
 ### Phase 7: Work Item Template
 
-The CI/CD pipeline must provision a work item template for this test.
+Create and publish a work item template for this test.
 
-1. Create a `deploy/work-item-template.json` in the repo
-2. Template type: `testplan`
-3. Template name: match the test program name
-4. Include:
-   - Resource requirements (system, fixtures, DUTs)
-   - Configurable properties for test parameters
-   - Part number filter restricting to the target product
-   - Description and summary
-   - Workflow association for state transitions (NEW → SCHEDULED → IN_PROGRESS → COMPLETED/FAILED)
-5. Provision via `slcli workitem template create` in the pipeline
+1. Create `deploy/work-item-template.json` in the repo
+2. **IMPORTANT**: Use `partNumbers` (array of strings), NOT `partNumberFilter`:
+   ```json
+   {
+     "name": "MyTestProgram",
+     "type": "testplan",
+     "templateGroup": "My Test Group",
+     "partNumbers": ["PART-NUMBER-HERE"],
+     "description": "...",
+     "summary": "...",
+     "resources": {
+       "systems": { "count": 1, "filter": "" },
+       "duts": { "count": 1, "filter": "AssetType == \"DEVICE_UNDER_TEST\"" },
+       "fixtures": { "count": 0, "filter": "" }
+     },
+     "properties": {
+       "param_key": "default_value"
+     }
+   }
+   ```
+3. Publish via: `slcli workitem template create --file deploy/work-item-template.json -w <WORKSPACE>`
+4. Update via: `slcli workitem template update <TEMPLATE_ID> --file deploy/work-item-template.json`
 
 ### Phase 8: Error Handling
 
@@ -156,12 +365,15 @@ Retry transient HTTP errors (429, 500, 502, 503) with exponential backoff, up to
 ## Key Rules
 
 1. **`nisystemlink-clients` only** — no direct HTTP calls to SystemLink APIs
-2. **No hard-coded credentials** — use environment variables or config files
-3. **workItemId on every result** — links results to originating work order
-4. **Limits from product specs** — never hard-code limits; read from product properties
-5. **All files linked** — uploaded files carry `resultId`, `workItemId`, `minionId`; result carries `fileIds`
-6. **Continue after step failure** — do not abort on first failed step
-7. **Headless compatible** — must run on Windows and Linux without GUI
+2. **No hard-coded credentials** — use CLI args, environment variables, or system credentials
+3. **`step_id` on every step** — `CreateStepRequest` requires `step_id=str(uuid.uuid4())`
+4. **`workItemId` on every result** — links results to originating work order
+5. **Limits from product specs with fallback** — read from product properties, fall back to `PRODUCT_SPECS` defaults
+6. **File upload uses `BinaryIO`** — `open(path, "rb")`, not `Path`; returns `str` file ID
+7. **MinionId from local file on managed systems** — Windows: `C:\ProgramData\National Instruments\salt\conf\minion_id`, Linux: `/etc/salt/minion_id`; dev mode uses work item system resource
+8. **Work item template uses `partNumbers` array** — not `partNumberFilter` string
+9. **Continue after step failure** — do not abort on first failed step
+10. **Three execution modes** — interactive (prompt), automated (headless), developer (explicit creds)
 
 ## References
 

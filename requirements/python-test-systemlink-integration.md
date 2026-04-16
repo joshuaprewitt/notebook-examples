@@ -20,7 +20,7 @@ This document defines the requirements for integrating a Python-based functional
 | **SystemLink Server** | SystemLink 2024 R1 or later with Test Monitor, Asset Management, and Work Order services enabled |
 | **Python** | 3.10 or later |
 | **SystemLink Python Client** | `nisystemlink-clients` package (latest) — the **sole** communication layer for all SystemLink server interactions. No direct HTTP/REST calls. |
-| **Authentication** | Valid API key with permissions for Test Monitor, Work Items, Assets, and File services |
+| **Authentication** | Valid API key or SystemLink system credentials (managed system). Dev mode accepts `--server` and `--api-key` CLI flags. |
 | **Network** | Test system must have HTTPS access to the SystemLink server API |
 
 ---
@@ -43,14 +43,14 @@ When a new test run begins, the system SHALL collect context from the work item 
 
 | ID | Requirement | Priority |
 |---|---|---|
-| TI-01 | The test script SHALL accept a **work item ID** via a CLI argument (e.g., `--work-item-id <ID>`). If the argument is not provided, it SHALL prompt the operator interactively (via CLI input, GUI dialog, or barcode scan). | Must |
+| TI-01 | The test script SHALL accept a **work item ID** via a CLI argument (e.g., `--work-item-id <ID>`). It SHALL also accept optional `--server` and `--api-key` arguments for developer mode on non-managed systems. If the work item ID argument is not provided, it SHALL prompt the operator interactively (via CLI input, GUI dialog, or barcode scan). | Must |
 | TI-02 | The test script SHALL query the SystemLink Work Item API using the provided work item ID and retrieve the full work item record. | Must |
 | TI-03 | The test script SHALL resolve the **product** linked to the work item (via part number) by querying the Test Monitor Product API. | Must |
 | TI-04 | If the product exists, the test script SHALL read the product's **properties** and use them as test specifications and conditions (e.g., voltage limits, temperature range, expected resistance). | Must |
 | TI-05 | If the product does **not** exist, the test script SHALL prompt the operator for a **data sheet** (file path or URL) and/or manual specification entry, then create the product in Test Monitor with the provided specs stored as product properties. | Must |
 | TI-06 | The test script SHALL resolve the **DUT** (Device Under Test) assigned to the work item by querying the Asset API using the work item's DUT resource assignment. | Must |
 | TI-07 | The test script SHALL extract the DUT's serial number, model, and relevant asset properties for use in the test result. | Must |
-| TI-08 | The test script SHALL resolve the **system** assigned to the work item and confirm it matches the system currently executing the test. | Must |
+| TI-08 | The test script SHALL resolve the **system/minionId** for result and file linking. On a managed system: read the local minionId from `C:\ProgramData\National Instruments\salt\conf\minion_id` (Windows) or `/etc/salt/minion_id` (Linux). In developer mode (explicit credentials): use the system resource ID assigned to the work item (`resources.systems.selections[0].id`). | Must |
 | TI-09 | The test script SHALL read **work item properties** (custom key-value pairs) and make them available as test parameters (e.g., test profile, environment conditions, customer-specific overrides). | Must |
 | TI-10 | The test script SHALL validate that all required parameters (product specs, DUT identity, system match) are resolved before proceeding to test execution. If any are missing, it SHALL abort with a clear error message. | Must |
 | TI-11 | In interactive mode, the test script SHOULD display a summary of resolved parameters (product, DUT serial, system, key specs) to the operator for confirmation before executing. In automated mode (work item ID passed via CLI), confirmation SHALL be skipped. | Should |
@@ -251,7 +251,7 @@ The CI/CD pipeline SHALL create (or update) a SystemLink work item template so t
 | WT-09 | The pipeline SHALL use `slcli workitem template create` (or update if it already exists) to provision the template to the target SystemLink server. | Must |
 | WT-10 | The pipeline SHALL provision the template to the same workspace used for the application's test results and feed. | Must |
 | WT-11 | The template version SHALL be kept in sync with the application version — when the application is updated and new parameters are added, the template SHALL be updated accordingly. | Must |
-| WT-12 | The template SHALL include a **part number filter** that restricts it to the specific product the test is designed for. Only work items for that part number SHALL be creatable from this template. | Must |
+| WT-12 | The template SHALL include a **`partNumbers`** array (not `partNumberFilter`) that restricts it to the specific product the test is designed for. Only work items for that part number SHALL be creatable from this template. Example: `"partNumbers": ["B0CG1KL3RC"]`. | Must |
 
 ---
 
@@ -341,13 +341,34 @@ Step **properties** SHALL include the following key-value pairs:
 
 ---
 
-## 8. Acceptance Criteria
+## 8. SDK Implementation Notes
+
+These notes capture verified SDK behaviors from the `nisystemlink-clients` package that are critical for correct implementation.
+
+| Topic | Detail |
+|---|---|
+| `CreateStepRequest.step_id` | **Required field**. Must set `step_id=str(uuid.uuid4())` on every step. |
+| `FileClient.upload_file(file=...)` | The `file` parameter takes a `BinaryIO` object (e.g., `open(path, "rb")`), **not** a file path. |
+| `upload_file()` return value | Returns a `str` (file ID) directly, **not** an object with `.id`. |
+| `Measurement` fields | All fields (`measurement`, `lowLimit`, `highLimit`, `units`) are **strings**, not numbers. |
+| `StatusType` usage | Use `StatusType.PASSED` enum, not string `"PASSED"`. For `Measurement.status`, use `status_type.value`. |
+| `Status` wrapper | Step and result status uses `Status(status_type=StatusType.PASSED)`, not `StatusType` directly. |
+| Product properties | May not contain all `spec.*` keys. Always fall back to `PRODUCT_SPECS` defaults. |
+| Work item state strings | Use string values for state: `"IN_PROGRESS"`, `"CLOSED"`, not enum values. |
+| `HttpConfiguration` with `None` | Passing `None` to client constructors triggers auto-discovery on managed systems. |
+| Work item template `partNumbers` | Use `partNumbers` (array of strings), **not** `partNumberFilter` (string). |
+
+---
+
+## 9. Acceptance Criteria
 
 1. A Python test script can query, claim, and close a SystemLink work item end-to-end.
 2. Every completed test run produces a structured result visible in the Test Monitor UI with correct status, steps, limits, and measurements.
 3. Supporting files (if any) are uploaded and traceable back to the originating test result.
 4. No API credentials are exposed in source code or logs.
 5. The test script recovers gracefully from transient server errors without data loss.
+6. The test supports three execution modes: interactive, automated (headless), and developer (explicit credentials).
+7. MinionId is correctly resolved from local file (managed) or work item resource (dev mode).
 6. The integration runs on both Windows and Linux without modification.
 7. The application is packaged as a `.nipkg`, uploadable to a SystemLink feed, and deployable to a test system via NI Package Manager.
 8. The CI/CD pipeline provisions a `testplan` work item template that allows operators to schedule and configure test runs from the SystemLink UI.
